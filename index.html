@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LOVE Lab - fotogramstudios - experimental</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤟</text></svg>">
+    <!-- MediaPipe Scripts from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;500;700&family=Playfair+Display:ital,wght@1,700&display=swap');
+
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: 'Space Grotesk', sans-serif;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            cursor: pointer; /* Essential for some mobile browsers to register delegation */
+        }
+
+        #container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        #ui-overlay {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        #central-prompt {
+            color: white;
+            font-size: 18px;
+            font-weight: 300;
+            opacity: 0.8;
+            transition: opacity 0.3s ease;
+            text-align: center;
+            padding: 0 20px;
+        }
+
+        #reset-hint {
+            position: absolute;
+            bottom: 40px;
+            color: white;
+            font-size: 12px;
+            opacity: 0.5;
+            text-align: center;
+        }
+
+        #video-element {
+            display: none;
+        }
+
+        #loading-screen {
+            position: absolute;
+            inset: 0;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            z-index: 100;
+            transition: opacity 0.5s ease;
+        }
+
+        .loading-logo {
+            display: flex;
+            align-items: baseline;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .loading-logo .fotogram {
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
+            font-size: 24px;
+            letter-spacing: 0.1em;
+        }
+
+        .loading-logo .love {
+            font-family: 'Playfair Display', serif;
+            font-style: italic;
+            font-weight: 700;
+            font-size: 28px;
+        }
+
+        .loading-text {
+            font-size: 10px;
+            font-weight: 300;
+            opacity: 0.6;
+            letter-spacing: 0.2em;
+            text-align: center;
+        }
+
+        .loader {
+            width: 30px;
+            height: 30px;
+            border: 2px solid #FFF;
+            border-bottom-color: transparent;
+            border-radius: 50%;
+            display: inline-block;
+            animation: rotation 1s linear infinite;
+            margin-bottom: 20px;
+        }
+
+        @keyframes rotation {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* TV Overlay Effects */
+
+        .tv-overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 5;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 4px, 3px 100%;
+            opacity: 0.4;
+        }
+
+        .vignette {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 6;
+            background: radial-gradient(circle, transparent 60%, rgba(0,0,0,0.4) 100%);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading-screen">
+        <div class="loading-logo">
+            <span class="fotogram">FOTOGRAM</span>
+            <span class="love">love</span>
+        </div>
+        <span class="loader"></span>
+        <div class="loading-text">
+            LOADING...
+        </div>
+    </div>
+
+    <div id="ui-overlay">
+        <div id="central-prompt">Make ILY sign 🤟 with both hands to continue...</div>
+        <div id="reset-hint" style="display: none;">Tap or Space to re-take</div>
+    </div>
+
+    <div class="tv-overlay"></div>
+    <div class="vignette"></div>
+
+    <div id="container">
+        <video id="video-element" playsinline></video>
+        <canvas id="main-canvas"></canvas>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('video-element');
+        const canvasElement = document.getElementById('main-canvas');
+        const ctx = canvasElement.getContext('2d');
+        const centralPrompt = document.getElementById('central-prompt');
+        const resetHint = document.getElementById('reset-hint');
+        const loadingScreen = document.getElementById('loading-screen');
+
+        // State Machine
+        const AppState = {
+            LIVE: 'LIVE',
+            FROZEN_OUTSIDE: 'FROZEN_OUTSIDE'
+        };
+
+        let currentState = AppState.LIVE;
+        let frozenBackground = null;
+        let frozenPoints = null; 
+        let gestureStartTime = null;
+        let flashOpacity = 0;
+        const GESTURE_HOLD_THRESHOLD = 2500; // 2.5 seconds
+
+        // MediaPipe Hands Setup
+        const hands = new Hands({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }
+        });
+
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+
+        function isILYHand(landmarks) {
+            const getDist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+            const wrist = landmarks[0];
+            const indexExtended = getDist(landmarks[8], wrist) > getDist(landmarks[6], wrist);
+            const thumbExtended = getDist(landmarks[4], landmarks[17]) > getDist(landmarks[3], landmarks[17]);
+            const middleCurled = getDist(landmarks[12], wrist) < getDist(landmarks[10], wrist);
+            const ringCurled = getDist(landmarks[16], wrist) < getDist(landmarks[14], wrist);
+            const pinkyExtended = getDist(landmarks[20], wrist) > getDist(landmarks[18], wrist);
+            return indexExtended && thumbExtended && middleCurled && ringCurled && pinkyExtended;
+        }
+
+        function drawTVOSD() {
+            ctx.save();
+            // Un-mirror for text
+            ctx.scale(-1, 1);
+            ctx.translate(-canvasElement.width, 0);
+
+            const startX = 40;
+            const startY = 40;
+
+            // "FOTOGRAM" text
+            ctx.font = '700 28px "Space Grotesk"';
+            ctx.fillStyle = 'white';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'top';
+            
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = 'rgba(255, 255, 255, 0.5)';
+            
+            ctx.fillText('FOTOGRAM', startX, startY);
+            const fotogramWidth = ctx.measureText('FOTOGRAM').width;
+
+            // "love" text
+            ctx.font = 'italic 700 32px "Playfair Display"';
+            ctx.fillText('love', startX + fotogramWidth + 12, startY - 2);
+            const loveWidth = ctx.measureText('love').width;
+            
+            // Add a small blinking dot
+            if (Math.floor(Date.now() / 500) % 2 === 0) {
+                ctx.beginPath();
+                ctx.arc(startX + fotogramWidth + 12 + loveWidth + 20, startY + 18, 6, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function onResults(results) {
+            if (loadingScreen.style.opacity !== '0') {
+                loadingScreen.style.opacity = '0';
+                setTimeout(() => loadingScreen.style.display = 'none', 500);
+            }
+
+            if (canvasElement.width !== videoElement.videoWidth) {
+                canvasElement.width = videoElement.videoWidth;
+                canvasElement.height = videoElement.videoHeight;
+            }
+
+            ctx.save();
+            ctx.scale(-1, 1);
+            ctx.translate(-canvasElement.width, 0);
+
+            if (currentState === AppState.FROZEN_OUTSIDE) {
+                renderFrame(frozenPoints);
+                centralPrompt.style.opacity = '0';
+            } else {
+                let detectedPoints = null;
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length === 2) {
+                    const hand1ILY = isILYHand(results.multiHandLandmarks[0]);
+                    const hand2ILY = isILYHand(results.multiHandLandmarks[1]);
+
+                    if (hand1ILY && hand2ILY) {
+                        const handA = { label: results.multiHandedness[0].label, landmarks: results.multiHandLandmarks[0] };
+                        const handB = { label: results.multiHandedness[1].label, landmarks: results.multiHandLandmarks[1] };
+                        const leftHand = handA.label === 'Left' ? handA : handB;
+                        const rightHand = handA.label === 'Right' ? handA : handB;
+
+                        detectedPoints = [
+                            { x: leftHand.landmarks[8].x * canvasElement.width, y: leftHand.landmarks[8].y * canvasElement.height },
+                            { x: rightHand.landmarks[8].x * canvasElement.width, y: rightHand.landmarks[8].y * canvasElement.height },
+                            { x: rightHand.landmarks[4].x * canvasElement.width, y: rightHand.landmarks[4].y * canvasElement.height },
+                            { x: leftHand.landmarks[4].x * canvasElement.width, y: leftHand.landmarks[4].y * canvasElement.height }
+                        ];
+
+                        if (!gestureStartTime) {
+                            gestureStartTime = Date.now();
+                        } else {
+                            const elapsed = Date.now() - gestureStartTime;
+                            if (elapsed >= GESTURE_HOLD_THRESHOLD) {
+                                freezeFrame(detectedPoints);
+                                // Immediately render the frozen state for this frame
+                                renderFrame(detectedPoints);
+                                drawTVOSD();
+                                if (flashOpacity > 0) {
+                                    ctx.fillStyle = `rgba(255, 255, 255, ${flashOpacity})`;
+                                    ctx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+                                    flashOpacity -= 0.1;
+                                }
+                                ctx.restore();
+                                return;
+                            }
+                        }
+                        
+                        renderFrame(detectedPoints);
+                        centralPrompt.style.opacity = '0';
+                    } else {
+                        gestureStartTime = null;
+                        renderDefault();
+                        centralPrompt.style.opacity = '0.8';
+                    }
+                } else {
+                    gestureStartTime = null;
+                    renderDefault();
+                    centralPrompt.style.opacity = '0.8';
+                }
+            }
+
+            // Draw TV OSD on top of everything
+            drawTVOSD();
+
+            if (flashOpacity > 0) {
+                ctx.fillStyle = `rgba(255, 255, 255, ${flashOpacity})`;
+                ctx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+                flashOpacity -= 0.1;
+            }
+
+            ctx.restore();
+        }
+
+        function freezeFrame(points) {
+            currentState = AppState.FROZEN_OUTSIDE;
+            frozenPoints = points;
+            flashOpacity = 1.0;
+            
+            frozenBackground = document.createElement('canvas');
+            frozenBackground.width = canvasElement.width;
+            frozenBackground.height = canvasElement.height;
+            const fCtx = frozenBackground.getContext('2d');
+            fCtx.drawImage(videoElement, 0, 0, frozenBackground.width, frozenBackground.height);
+
+            resetHint.style.display = 'block';
+        }
+
+        function resetApp() {
+            if (currentState === AppState.FROZEN_OUTSIDE) {
+                currentState = AppState.LIVE;
+                frozenBackground = null;
+                frozenPoints = null;
+                gestureStartTime = null;
+                resetHint.style.display = 'none';
+            }
+        }
+
+        function renderDefault() {
+            ctx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+        }
+
+        function renderFrame(points) {
+            if (currentState === AppState.LIVE) {
+                ctx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+                drawPolygon(points, true);
+            } else {
+                ctx.drawImage(frozenBackground, 0, 0, canvasElement.width, canvasElement.height);
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, points[0].y);
+                for (let i = 1; i < points.length; i++) {
+                    ctx.lineTo(points[i].x, points[i].y);
+                }
+                ctx.closePath();
+                ctx.clip();
+                ctx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+                ctx.restore();
+                drawPolygon(points, false);
+            }
+        }
+
+        function drawPolygon(points, isPreview) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let i = 1; i < points.length; i++) {
+                ctx.lineTo(points[i].x, points[i].y);
+            }
+            ctx.closePath();
+            
+            ctx.lineWidth = 1.5;
+            ctx.strokeStyle = '#ffffff';
+            ctx.globalCompositeOperation = 'difference';
+            ctx.stroke();
+
+            // Progress Fill Effect
+            if (isPreview && gestureStartTime) {
+                const elapsed = Date.now() - gestureStartTime;
+                const progress = Math.min(1, elapsed / GESTURE_HOLD_THRESHOLD);
+                
+                // Ease-out: fast at beginning, slow at end
+                const easedProgress = 1 - Math.pow(1 - progress, 4);
+                
+                // Calculate bounding box of polygon
+                const minX = Math.min(...points.map(p => p.x));
+                const maxX = Math.max(...points.map(p => p.x));
+                const minY = Math.min(...points.map(p => p.y));
+                const maxY = Math.max(...points.map(p => p.y));
+                
+                const boxWidth = maxX - minX;
+                const boxHeight = maxY - minY;
+
+                ctx.save();
+                // Clip to the polygon so the fill stays inside the hand-frame
+                ctx.beginPath();
+                ctx.moveTo(points[0].x, points[0].y);
+                for (let i = 1; i < points.length; i++) {
+                    ctx.lineTo(points[i].x, points[i].y);
+                }
+                ctx.closePath();
+                ctx.clip();
+
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+                ctx.globalCompositeOperation = 'difference';
+                
+                // Fill from user-left to user-right
+                // In mirrored space, user-left is maxX, user-right is minX
+                ctx.fillRect(maxX, minY, -boxWidth * easedProgress, boxHeight);
+                ctx.restore();
+            }
+            
+            ctx.restore();
+        }
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+
+        camera.start().catch(err => {
+            console.error("Camera failed:", err);
+            loadingScreen.innerHTML = `<p style="color: #ff3366">Camera Access Denied.</p>`;
+        });
+
+        hands.onResults(onResults);
+        
+        // Add both click and touchstart for better mobile support
+        const handleReset = (e) => {
+            // Prevent default only if necessary, but here we just want to reset
+            resetApp();
+        };
+
+        window.addEventListener('click', handleReset);
+        window.addEventListener('touchstart', handleReset);
+        
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                resetApp();
+            }
+        });
+    </script>
+</body>
+</html>
